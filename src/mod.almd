@@ -1,0 +1,288 @@
+import math
+
+// Minecraft PvP combat utilities for 1.21.1.
+// Corresponds to PrismarineJS/mineflayer-pvp.
+//
+// Usage:
+//   import mc_pvp
+//   let dmg = mc_pvp.melee_damage("diamond_sword", 0)
+//   let can = mc_pvp.can_attack(last_attack_tick, current_tick, attack_speed)
+
+// --- Types ---
+
+type Pos = { x: Float, y: Float, z: Float }
+
+type Entity = {
+  id: Int,
+  pos: Pos,
+  health: Float,
+  entity_type: String,
+}
+
+type WeaponStats = {
+  name: String,
+  base_damage: Float,
+  attack_speed: Float,
+  reach: Float,
+}
+
+type CombatState = {
+  target: Option[Entity],
+  last_attack_tick: Int,
+  is_sprinting: Bool,
+  shield_active: Bool,
+}
+
+// --- Weapon database ---
+
+fn weapon(name: String) -> WeaponStats = {
+  match name {
+    "wooden_sword" =>    { name: name, base_damage: 4.0,  attack_speed: 1.6, reach: 3.0 },
+    "stone_sword" =>     { name: name, base_damage: 5.0,  attack_speed: 1.6, reach: 3.0 },
+    "iron_sword" =>      { name: name, base_damage: 6.0,  attack_speed: 1.6, reach: 3.0 },
+    "golden_sword" =>    { name: name, base_damage: 4.0,  attack_speed: 1.6, reach: 3.0 },
+    "diamond_sword" =>   { name: name, base_damage: 7.0,  attack_speed: 1.6, reach: 3.0 },
+    "netherite_sword" => { name: name, base_damage: 8.0,  attack_speed: 1.6, reach: 3.0 },
+    "wooden_axe" =>      { name: name, base_damage: 7.0,  attack_speed: 0.8, reach: 3.0 },
+    "stone_axe" =>       { name: name, base_damage: 9.0,  attack_speed: 0.8, reach: 3.0 },
+    "iron_axe" =>        { name: name, base_damage: 9.0,  attack_speed: 0.9, reach: 3.0 },
+    "golden_axe" =>      { name: name, base_damage: 7.0,  attack_speed: 1.0, reach: 3.0 },
+    "diamond_axe" =>     { name: name, base_damage: 9.0,  attack_speed: 1.0, reach: 3.0 },
+    "netherite_axe" =>   { name: name, base_damage: 10.0, attack_speed: 1.0, reach: 3.0 },
+    "trident" =>         { name: name, base_damage: 9.0,  attack_speed: 1.1, reach: 3.0 },
+    "mace" =>            { name: name, base_damage: 6.0,  attack_speed: 0.6, reach: 3.0 },
+    _ =>                 { name: "fist", base_damage: 1.0, attack_speed: 4.0, reach: 3.0 },
+  }
+}
+
+// --- Damage calculation ---
+
+// Attack cooldown in ticks (20 ticks/sec).
+fn cooldown_ticks(attack_speed: Float) -> Int = {
+  let ticks = 20.0 / attack_speed
+  float.to_int(ticks)
+}
+
+// Whether the attack cooldown has elapsed.
+fn can_attack(last_attack_tick: Int, current_tick: Int, attack_speed: Float) -> Bool = {
+  let cd = cooldown_ticks(attack_speed)
+  (current_tick - last_attack_tick) >= cd
+}
+
+// Charge percentage (0.0 to 1.0).
+fn charge_percent(last_attack_tick: Int, current_tick: Int, attack_speed: Float) -> Float = {
+  let elapsed = int.to_float(current_tick - last_attack_tick)
+  let cd = 20.0 / attack_speed
+  let pct = elapsed / cd
+  if pct > 1.0 then 1.0
+  else if pct < 0.0 then 0.0
+  else pct
+}
+
+// Melee damage with charge multiplier.
+fn melee_damage(weapon_name: String, charge: Float) -> Float = {
+  let w = weapon(weapon_name)
+  // Damage formula: base * (0.2 + charge^2 * 0.8)
+  let multiplier = 0.2 + charge * charge * 0.8
+  w.base_damage * multiplier
+}
+
+// Critical hit: falling + full charge = 1.5x damage.
+fn critical_damage(base_damage: Float, is_falling: Bool, charge: Float) -> Float = {
+  if is_falling and charge >= 1.0 then base_damage * 1.5
+  else base_damage
+}
+
+// Sprint attack: +1 knockback level.
+fn sprint_knockback(base_kb: Int, is_sprinting: Bool) -> Int =
+  if is_sprinting then base_kb + 1 else base_kb
+
+// --- Distance ---
+
+fn distance(a: Pos, b: Pos) -> Float = {
+  let dx = a.x - b.x
+  let dy = a.y - b.y
+  let dz = a.z - b.z
+  math.sqrt(dx * dx + dy * dy + dz * dz)
+}
+
+fn in_reach(attacker: Pos, target: Pos, reach: Float) -> Bool =
+  distance(attacker, target) <= reach
+
+// --- Armor reduction ---
+
+// Damage after armor. armor: total armor points (0-20), toughness: armor toughness.
+fn damage_after_armor(damage: Float, armor: Float, toughness: Float) -> Float = {
+  // Minecraft formula: damage * (1 - min(20, max(armor/5, armor - 4*damage/(toughness+8))) / 25)
+  let inner = armor - 4.0 * damage / (toughness + 8.0)
+  let a5 = armor / 5.0
+  let clamped = if inner > a5 then inner else a5
+  let defense = if clamped > 20.0 then 20.0 else clamped
+  let reduction = defense / 25.0
+  damage * (1.0 - reduction)
+}
+
+// --- Combat state ---
+
+fn new_combat_state() -> CombatState = {
+  { target: none, last_attack_tick: 0, is_sprinting: false, shield_active: false }
+}
+
+fn set_target(state: CombatState, entity: Entity) -> CombatState =
+  { ...state, target: some(entity) }
+
+fn clear_target(state: CombatState) -> CombatState =
+  { ...state, target: none }
+
+fn record_attack(state: CombatState, tick: Int) -> CombatState =
+  { ...state, last_attack_tick: tick }
+
+fn set_sprinting(state: CombatState, sprinting: Bool) -> CombatState =
+  { ...state, is_sprinting: sprinting }
+
+fn set_shield(state: CombatState, active: Bool) -> CombatState =
+  { ...state, shield_active: active }
+
+// Shield blocks 100% of melee damage from front.
+fn shield_reduces(damage: Float, shield_active: Bool) -> Float =
+  if shield_active then 0.0 else damage
+
+// --- Target selection ---
+
+// Select nearest hostile entity from a list.
+fn nearest_entity(entities: List[Entity], pos: Pos) -> Option[Entity] = {
+  if list.is_empty(entities) then none
+  else {
+    var best = list.get(entities, 0) ?? { id: 0, pos: { x: 0.0, y: 0.0, z: 0.0 }, health: 0.0, entity_type: "" }
+    var best_dist = distance(pos, best.pos)
+    for e in entities {
+      let d = distance(pos, e.pos)
+      if d < best_dist then { best = e; best_dist = d } else { () }
+    }
+    some(best)
+  }
+}
+
+// Filter entities within reach.
+fn entities_in_reach(entities: List[Entity], pos: Pos, reach: Float) -> List[Entity] =
+  list.filter(entities, (e) => distance(pos, e.pos) <= reach)
+
+// --- Tests ---
+
+test "weapon" where [
+  "diamond_sword"   [name = "diamond_sword",   want_dmg = 7.0],
+  "netherite_sword" [name = "netherite_sword",  want_dmg = 8.0],
+  "fist"            [name = "anything_else",    want_dmg = 1.0],
+  "diamond_axe"     [name = "diamond_axe",      want_dmg = 9.0],
+] {
+  assert_eq(weapon(name).base_damage, want_dmg)
+}
+
+test "cooldown_ticks" where [
+  "sword" [speed = 1.6, want = 12],
+  "axe"   [speed = 1.0, want = 20],
+  "fist"  [speed = 4.0, want = 5],
+] {
+  assert_eq(cooldown_ticks(speed), want)
+}
+
+test "can_attack" {
+  assert(not can_attack(0, 5, 1.6))
+  assert(can_attack(0, 12, 1.6))
+  assert(can_attack(0, 20, 1.6))
+}
+
+test "charge_percent" {
+  assert_eq(charge_percent(0, 0, 1.6), 0.0)
+  // 12 ticks / (20/1.6=12.5 ticks) = 0.96
+  assert(charge_percent(0, 12, 1.6) > 0.9)
+  assert_eq(charge_percent(0, 13, 1.6), 1.0)
+}
+
+test "melee_damage - full charge" {
+  let dmg = melee_damage("diamond_sword", 1.0)
+  assert_eq(dmg, 7.0)
+}
+
+test "melee_damage - zero charge" {
+  let dmg = melee_damage("diamond_sword", 0.0)
+  // 7.0 * (0.2 + 0*0*0.8) = 7.0 * 0.2 ≈ 1.4
+  assert(dmg > 1.39)
+  assert(dmg < 1.41)
+}
+
+test "critical_damage" {
+  assert_eq(critical_damage(7.0, true, 1.0), 10.5)
+  assert_eq(critical_damage(7.0, false, 1.0), 7.0)
+  assert_eq(critical_damage(7.0, true, 0.5), 7.0)
+}
+
+test "sprint_knockback" {
+  assert_eq(sprint_knockback(0, true), 1)
+  assert_eq(sprint_knockback(0, false), 0)
+  assert_eq(sprint_knockback(2, true), 3)
+}
+
+test "distance" {
+  let d = distance({ x: 0.0, y: 0.0, z: 0.0 }, { x: 3.0, y: 4.0, z: 0.0 })
+  assert_eq(d, 5.0)
+}
+
+test "in_reach" {
+  assert(in_reach({ x: 0.0, y: 0.0, z: 0.0 }, { x: 2.0, y: 0.0, z: 0.0 }, 3.0))
+  assert(not in_reach({ x: 0.0, y: 0.0, z: 0.0 }, { x: 4.0, y: 0.0, z: 0.0 }, 3.0))
+}
+
+test "damage_after_armor" {
+  // No armor
+  assert_eq(damage_after_armor(10.0, 0.0, 0.0), 10.0)
+  // Full diamond (20 armor, 8 toughness)
+  let reduced = damage_after_armor(10.0, 20.0, 8.0)
+  assert(reduced < 10.0)
+  assert(reduced > 0.0)
+}
+
+test "shield_reduces" {
+  assert_eq(shield_reduces(7.0, true), 0.0)
+  assert_eq(shield_reduces(7.0, false), 7.0)
+}
+
+test "combat state" {
+  let state = new_combat_state()
+  let e: Entity = { id: 1, pos: { x: 1.0, y: 0.0, z: 0.0 }, health: 20.0, entity_type: "player" }
+  let s2 = set_target(state, e)
+  match s2.target {
+    some(t) => assert_eq(t.id, 1),
+    none => assert(false),
+  }
+  let s3 = clear_target(s2)
+  match s3.target {
+    some(_t) => assert(false),
+    none => assert(true),
+  }
+}
+
+test "nearest_entity" {
+  let a: Entity = { id: 1, pos: { x: 5.0, y: 0.0, z: 0.0 }, health: 20.0, entity_type: "zombie" }
+  let b: Entity = { id: 2, pos: { x: 2.0, y: 0.0, z: 0.0 }, health: 20.0, entity_type: "skeleton" }
+  let nearest = nearest_entity([a, b], { x: 0.0, y: 0.0, z: 0.0 })
+  match nearest {
+    some(e) => assert_eq(e.id, 2),
+    none => assert(false),
+  }
+}
+
+test "entities_in_reach" {
+  let a: Entity = { id: 1, pos: { x: 2.0, y: 0.0, z: 0.0 }, health: 20.0, entity_type: "zombie" }
+  let b: Entity = { id: 2, pos: { x: 5.0, y: 0.0, z: 0.0 }, health: 20.0, entity_type: "skeleton" }
+  let in_range = entities_in_reach([a, b], { x: 0.0, y: 0.0, z: 0.0 }, 3.0)
+  assert_eq(list.length(in_range), 1)
+}
+
+test "nearest_entity - empty" {
+  let nearest = nearest_entity([], { x: 0.0, y: 0.0, z: 0.0 })
+  match nearest {
+    some(_e) => assert(false),
+    none => assert(true),
+  }
+}
