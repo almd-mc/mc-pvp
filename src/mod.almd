@@ -60,7 +60,7 @@ fn weapon(name: String) -> WeaponStats = {
 // Attack cooldown in ticks (20 ticks/sec).
 fn cooldown_ticks(attack_speed: Float) -> Int = {
   let ticks = 20.0 / attack_speed
-  float.to_int(ticks)
+  int.from_saturating(ticks)
 }
 
 // Whether the attack cooldown has elapsed.
@@ -71,7 +71,7 @@ fn can_attack(last_attack_tick: Int, current_tick: Int, attack_speed: Float) -> 
 
 // Charge percentage (0.0 to 1.0).
 fn charge_percent(last_attack_tick: Int, current_tick: Int, attack_speed: Float) -> Float = {
-  let elapsed = int.to_float(current_tick - last_attack_tick)
+  let elapsed = float.from(current_tick - last_attack_tick)
   let cd = 20.0 / attack_speed
   let pct = elapsed / cd
   if pct > 1.0 then 1.0
